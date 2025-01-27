@@ -466,7 +466,7 @@ class LotteryPredictor:
         return np.array(history)
 
     def _calculate_base_probabilities(self):
-    """Calcula probabilidades base para cada número usando múltiplas análises"""
+    #"""Calcula probabilidades base para cada número usando múltiplas análises"""
     probabilities = np.zeros(self.num_numbers)
     
     # 1. Probabilidades da Cadeia de Markov
