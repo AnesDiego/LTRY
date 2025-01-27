@@ -466,53 +466,87 @@ class LotteryPredictor:
         return np.array(history)
 
     def _calculate_base_probabilities(self):
-        """Calcula probabilidades base para cada número usando múltiplas análises"""
-        probabilities = np.zeros(self.num_numbers)
+    """Calcula probabilidades base para cada número usando múltiplas análises"""
+    probabilities = np.zeros(self.num_numbers)
+    
+    # 1. Probabilidades da Cadeia de Markov
+    if self.historical_data.empty:
+        return np.ones(self.num_numbers) / self.num_numbers
         
-        # 1. Probabilidades da Cadeia de Markov
-        if self.historical_data.empty:
-            return np.ones(self.num_numbers) / self.num_numbers
-            
-        last_numbers = sorted([int(self.historical_data.iloc[-1][f'Bola{i}']) for i in range(1, 16)])
-        markov_probs = np.zeros(self.num_numbers)
-        for last_num in last_numbers:
-            markov_probs += self.markov_chain.get_transition_probabilities(last_num)
+    last_numbers = sorted([int(self.historical_data.iloc[-1][f'Bola{i}']) for i in range(1, 16)])
+    markov_probs = np.zeros(self.num_numbers)
+    for last_num in last_numbers:
+        markov_probs += self.markov_chain.get_transition_probabilities(last_num)
+    
+    # Verifica se há números válidos antes de dividir
+    if len(last_numbers) > 0:
         markov_probs /= len(last_numbers)
-        
-        # 2. Probabilidades baseadas em padrões
-        pattern_probs = np.zeros(self.num_numbers)
-        pattern_data = self.combination_analyzer.get_pattern_probabilities()
-        for num in range(1, self.num_numbers + 1):
-            pattern_probs[num-1] = sum(v for k, v in pattern_data.items() if f"_{num}" in k)
-        pattern_probs = pattern_probs / np.sum(pattern_probs)
-        
-        # 3. Probabilidades baseadas em séries temporais
-        arima_probs = np.zeros(self.num_numbers)
-        for num in range(1, self.num_numbers + 1):
-            if num in self.time_series_analyzer.arima_models:
-                try:
-                    forecast = self.time_series_analyzer.arima_models[num].forecast(1)
-                    arima_probs[num-1] = max(0, min(1, forecast[0]))
-                except:
-                    arima_probs[num-1] = 1/self.num_numbers
-        arima_probs = arima_probs / np.sum(arima_probs)
-        
-        # 4. Análise de Recência
-        recency_probs = np.zeros(self.num_numbers)
-        for num in range(1, self.num_numbers + 1):
-            history = self._get_number_history(num)
+    else:
+        markov_probs = np.ones(self.num_numbers) / self.num_numbers
+    
+    # 2. Probabilidades baseadas em padrões
+    pattern_probs = np.zeros(self.num_numbers)
+    pattern_data = self.combination_analyzer.get_pattern_probabilities()
+    for num in range(1, self.num_numbers + 1):
+        pattern_probs[num-1] = sum(v for k, v in pattern_data.items() if f"_{num}" in k)
+    
+    # Verifica se a soma é zero antes de normalizar
+    pattern_sum = np.sum(pattern_probs)
+    if pattern_sum > 0:
+        pattern_probs = pattern_probs / pattern_sum
+    else:
+        pattern_probs = np.ones(self.num_numbers) / self.num_numbers
+    
+    # 3. Probabilidades baseadas em séries temporais
+    arima_probs = np.zeros(self.num_numbers)
+    for num in range(1, self.num_numbers + 1):
+        if num in self.time_series_analyzer.arima_models:
+            try:
+                forecast = self.time_series_analyzer.arima_models[num].forecast(1)
+                arima_probs[num-1] = max(0, min(1, forecast[0]))
+            except:
+                arima_probs[num-1] = 1/self.num_numbers
+    
+    # Verifica se a soma é zero antes de normalizar
+    arima_sum = np.sum(arima_probs)
+    if arima_sum > 0:
+        arima_probs = arima_probs / arima_sum
+    else:
+        arima_probs = np.ones(self.num_numbers) / self.num_numbers
+    
+    # 4. Análise de Recência
+    recency_probs = np.zeros(self.num_numbers)
+    for num in range(1, self.num_numbers + 1):
+        history = self._get_number_history(num)
+        if len(history) > 0:
             last_appearance = len(history) - 1 - np.argmax(history[::-1])
             recency_probs[num-1] = 1 / (1 + last_appearance)
-        recency_probs = recency_probs / np.sum(recency_probs)
-        
-        # Combina todas as probabilidades com pesos diferentes
-        weights = [0.3, 0.25, 0.25, 0.2]  # Pesos para cada tipo de probabilidade
-        probabilities = (weights[0] * markov_probs +
-                        weights[1] * pattern_probs +
-                        weights[2] * arima_probs +
-                        weights[3] * recency_probs)
-        
-        return probabilities
+        else:
+            recency_probs[num-1] = 1 / self.num_numbers
+    
+    # Verifica se a soma é zero antes de normalizar
+    recency_sum = np.sum(recency_probs)
+    if recency_sum > 0:
+        recency_probs = recency_probs / recency_sum
+    else:
+        recency_probs = np.ones(self.num_numbers) / self.num_numbers
+    
+    # Combina todas as probabilidades com pesos diferentes
+    weights = [0.3, 0.25, 0.25, 0.2]  # Pesos para cada tipo de probabilidade
+    probabilities = (weights[0] * markov_probs +
+                    weights[1] * pattern_probs +
+                    weights[2] * arima_probs +
+                    weights[3] * recency_probs)
+    
+    # Verifica se há NaN e substitui por distribuição uniforme se necessário
+    if np.any(np.isnan(probabilities)):
+        logger.warning("Detectados valores NaN nas probabilidades. Usando distribuição uniforme.")
+        return np.ones(self.num_numbers) / self.num_numbers
+    
+    # Garante que a soma das probabilidades é 1
+    probabilities = probabilities / np.sum(probabilities)
+    
+    return probabilities
 
     def generate_prediction(self):
         """Gera nova previsão utilizando todos os modelos e análises"""
