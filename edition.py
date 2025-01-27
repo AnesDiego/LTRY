@@ -677,7 +677,7 @@ def _analyze_recent_patterns(self):
         
         return patterns
 
-def run(self):
+    def run(self):
         """Executa o sistema de previsão"""
         logger.info("Iniciando sistema de previsão da Lotofácil...")
         
