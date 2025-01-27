@@ -1,182 +1,383 @@
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import LSTM, Dense, Dropout, Bidirectional, BatchNormalization
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from tensorflow.keras.models import Sequential, Model, load_model
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Bidirectional, Input, Attention, MultiHeadAttention
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingRegressor
+from sklearn.model_selection import TimeSeriesSplit
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.arima.model import ARIMA
+from scipy.stats import entropy, chi2_contingency
+from scipy.special import softmax
 import xgboost as xgb
 import tensorflow as tf
 import os
 import joblib
 import warnings
-from datetime import datetime
-from scipy import stats
-import traceback
+from datetime import datetime, timedelta
+import itertools
+from collections import defaultdict, Counter
+import logging
+import json
 
+# PRIMEIRO: Criar diretório .data ANTES de qualquer configuração de logging
+data_dir = '.data'
+if not os.path.exists(data_dir):
+    os.makedirs(data_dir)
+
+# DEPOIS: Configurar warnings e logs
 warnings.filterwarnings('ignore')
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 tf.get_logger().setLevel('ERROR')
 
-class StatisticalAnalyzer:
-    def __init__(self, historical_data):
-        self.data = historical_data
-        self.num_numbers = 25
-        self.numbers_to_choose = 15
-        
-    def get_frequency_metrics(self, window_size=30):
-        """Analisa frequências em diferentes janelas temporais"""
-        frequencies = {}
-        recency = {}
-        for window in [window_size, window_size*2, window_size*4]:
-            last_n = self.data.tail(window)
-            freq = {}
-            for i in range(1, self.num_numbers + 1):
-                freq[i] = sum((last_n[[f'Bola{j}' for j in range(1, 16)]].values == i).any(axis=1))
-            frequencies[window] = freq
-            
-        for num in range(1, self.num_numbers + 1):
-            for idx in range(len(self.data)-1, -1, -1):
-                if num in [self.data.iloc[idx][f'Bola{i}'] for i in range(1, 16)]:
-                    recency[num] = len(self.data) - idx - 1
-                    break
-        
-        return frequencies, recency
+# FINALMENTE: Configurar logging
+log_file = os.path.join(data_dir, 'lottery_predictor.log')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_file),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-    def get_pattern_metrics(self):
-        """Analisa padrões de sequências e combinações"""
-        patterns = {
-            'consecutive_pairs': {},
-            'common_combinations': {},
-            'position_frequencies': {}
+# Verificação adicional (opcional, apenas para debug)
+logger.info(f"Diretório .data existe: {os.path.exists(data_dir)}")
+logger.info(f"Arquivo de log criado em: {log_file}")
+
+class MarkovChain:
+    """
+    Implementa uma Cadeia de Markov para análise de transições de números
+    """
+    def __init__(self, n_numbers=25):
+        self.n_numbers = n_numbers
+        self.transition_matrix = np.zeros((n_numbers, n_numbers))
+        self.state_counts = np.zeros(n_numbers)
+        
+    def fit(self, sequences):
+        """
+        Treina a cadeia de Markov com sequências de números
+        """
+        for sequence in sequences:
+            for i in range(len(sequence)-1):
+                current = sequence[i] - 1  # Ajusta para índice 0-based
+                next_num = sequence[i+1] - 1
+                self.transition_matrix[current][next_num] += 1
+                self.state_counts[current] += 1
+        
+        # Normaliza as probabilidades
+        for i in range(self.n_numbers):
+            if self.state_counts[i] > 0:
+                self.transition_matrix[i] = self.transition_matrix[i] / self.state_counts[i]
+            else:
+                self.transition_matrix[i] = 1.0 / self.n_numbers
+                
+    def get_transition_probabilities(self, current_state):
+        """
+        Retorna probabilidades de transição para um estado atual
+        """
+        return self.transition_matrix[current_state-1]
+
+class CombinationAnalyzer:
+    """
+    Analisa padrões combinatórios nos números sorteados
+    """
+    def __init__(self, n_numbers=25, k_choose=15):
+        self.n_numbers = n_numbers
+        self.k_choose = k_choose
+        self.pattern_counts = defaultdict(int)
+        self.total_patterns = 0
+        
+    def analyze_patterns(self, sequences):
+        """
+        Analisa padrões nos números sorteados
+        """
+        for sequence in sequences:
+            # Análise de pares adjacentes
+            pairs = list(zip(sequence[:-1], sequence[1:]))
+            for pair in pairs:
+                self.pattern_counts[f"pair_{pair}"] += 1
+            
+            # Análise de gaps entre números
+            gaps = np.diff(sequence)
+            for gap in gaps:
+                self.pattern_counts[f"gap_{gap}"] += 1
+            
+            # Análise de distribuição de paridade
+            even_count = sum(1 for num in sequence if num % 2 == 0)
+            self.pattern_counts[f"even_{even_count}"] += 1
+            
+            self.total_patterns += 1
+    
+    def get_pattern_probabilities(self):
+        """
+        Retorna probabilidades dos padrões identificados
+        """
+        probabilities = {}
+        for pattern, count in self.pattern_counts.items():
+            probabilities[pattern] = count / self.total_patterns
+        return probabilities
+
+class TimeSeriesAnalyzer:
+    """
+    Realiza análises de séries temporais nos dados
+    """
+    def __init__(self):
+        self.arima_models = {}
+        self.seasonal_patterns = {}
+        
+    def fit_arima(self, data, number):
+        """
+        Ajusta modelo ARIMA para um número específico
+        """
+        try:
+            model = ARIMA(data, order=(5,1,2))
+            self.arima_models[number] = model.fit()
+            return True
+        except:
+            return False
+            
+    def analyze_seasonality(self, sequences, window_size=30):
+        """
+        Analisa padrões sazonais nos dados
+        """
+        number_occurrences = defaultdict(list)
+        
+        for i, sequence in enumerate(sequences):
+            for number in sequence:
+                number_occurrences[number].append(i)
+        
+        for number, occurrences in number_occurrences.items():
+            if len(occurrences) > window_size:
+                diffs = np.diff(occurrences)
+                self.seasonal_patterns[number] = np.mean(diffs)
+
+class PatternLearner:
+    """
+    Implementa aprendizado de padrões complexos usando técnicas avançadas
+    """
+    def __init__(self, sequence_length=10, n_numbers=25):
+        self.sequence_length = sequence_length
+        self.n_numbers = n_numbers
+        self.pattern_memory = defaultdict(list)
+        self.frequency_matrix = np.zeros((n_numbers, n_numbers))
+        self.success_patterns = defaultdict(int)
+        
+    def update_frequency_matrix(self, sequences):
+        """
+        Atualiza matriz de frequência de co-ocorrência de números
+        """
+        for sequence in sequences:
+            for i in range(len(sequence)):
+                for j in range(i + 1, len(sequence)):
+                    num1, num2 = sequence[i] - 1, sequence[j] - 1
+                    self.frequency_matrix[num1][num2] += 1
+                    self.frequency_matrix[num2][num1] += 1
+        
+        # Normaliza a matriz
+        row_sums = self.frequency_matrix.sum(axis=1)
+        self.frequency_matrix = self.frequency_matrix / row_sums[:, np.newaxis]
+        
+    def find_winning_patterns(self, historical_data, predictions):
+        """
+        Identifica padrões que levaram a previsões bem-sucedidas
+        """
+        for pred, actual in zip(predictions, historical_data):
+            matches = len(set(pred) & set(actual))
+            if matches >= 11:  # Padrão considerado bem-sucedido se acertar 11 ou mais
+                pattern = self._extract_pattern(pred)
+                self.success_patterns[pattern] += 1
+    
+    def _extract_pattern(self, numbers):
+        """
+        Extrai padrões característicos de uma sequência de números
+        """
+        pattern = {
+            'gaps': np.diff(sorted(numbers)).tolist(),
+            'even_ratio': sum(1 for n in numbers if n % 2 == 0) / len(numbers),
+            'sum': sum(numbers),
+            'variance': np.var(numbers)
         }
+        return json.dumps(pattern)
+    
+    def get_pattern_scores(self, candidate_numbers):
+        """
+        Calcula pontuação de um conjunto de números baseado em padrões bem-sucedidos
+        """
+        pattern = self._extract_pattern(candidate_numbers)
+        base_score = self.success_patterns.get(pattern, 0)
         
-        for idx in range(len(self.data)):
-            numbers = sorted([self.data.iloc[idx][f'Bola{i}'] for i in range(1, 16)])
-            for i in range(len(numbers)-1):
-                pair = (numbers[i], numbers[i+1])
-                patterns['consecutive_pairs'][pair] = patterns['consecutive_pairs'].get(pair, 0) + 1
+        # Adiciona análise de co-ocorrência
+        cooc_score = 0
+        for i in range(len(candidate_numbers)):
+            for j in range(i + 1, len(candidate_numbers)):
+                num1, num2 = candidate_numbers[i] - 1, candidate_numbers[j] - 1
+                cooc_score += self.frequency_matrix[num1][num2]
         
-        for pos in range(1, 16):
-            patterns['position_frequencies'][pos] = {}
-            for num in range(1, self.num_numbers + 1):
-                patterns['position_frequencies'][pos][num] = sum(self.data[f'Bola{pos}'] == num)
-        
-        return patterns
+        return base_score + (cooc_score / (len(candidate_numbers) * (len(candidate_numbers) - 1) / 2))
 
-    def get_correlation_metrics(self):
-        """Analisa correlações entre números"""
-        correlations = np.zeros((self.num_numbers, self.num_numbers))
-        number_matrix = np.zeros((len(self.data), self.num_numbers))
+class StochasticOptimizer:
+    """
+    Implementa otimização estocástica para seleção de números
+    """
+    def __init__(self, n_numbers=25, k_choose=15):
+        self.n_numbers = n_numbers
+        self.k_choose = k_choose
+        self.temperature = 1.0
+        self.cooling_rate = 0.95
+        self.min_temperature = 0.01
         
-        for idx, row in self.data.iterrows():
-            numbers = [int(row[f'Bola{i}']) - 1 for i in range(1, 16)]
-            number_matrix[idx, numbers] = 1
+    def optimize_selection(self, probabilities, pattern_learner, iterations=1000):
+        """
+        Usa simulated annealing para otimizar seleção de números
+        """
+        current_solution = self._initial_solution(probabilities)
+        current_score = self._evaluate_solution(current_solution, pattern_learner)
+        best_solution = current_solution.copy()
+        best_score = current_score
+        
+        temp = self.temperature
+        while temp > self.min_temperature and iterations > 0:
+            neighbor = self._get_neighbor(current_solution)
+            neighbor_score = self._evaluate_solution(neighbor, pattern_learner)
             
-        correlations = np.corrcoef(number_matrix.T)
-        return correlations
+            delta = neighbor_score - current_score
+            if delta > 0 or np.random.random() < np.exp(delta / temp):
+                current_solution = neighbor
+                current_score = neighbor_score
+                
+                if current_score > best_score:
+                    best_solution = current_solution.copy()
+                    best_score = current_score
+            
+            temp *= self.cooling_rate
+            iterations -= 1
+        
+        return sorted(best_solution)
+    
+    def _initial_solution(self, probabilities):
+        """
+        Gera solução inicial baseada em probabilidades
+        """
+        return np.random.choice(
+            np.arange(1, self.n_numbers + 1),
+            size=self.k_choose,
+            replace=False,
+            p=probabilities/np.sum(probabilities)
+        )
+    
+    def _get_neighbor(self, solution):
+        """
+        Gera solução vizinha trocando um número
+        """
+        neighbor = solution.copy()
+        idx = np.random.randint(len(neighbor))
+        available = list(set(range(1, self.n_numbers + 1)) - set(neighbor))
+        neighbor[idx] = np.random.choice(available)
+        return neighbor
+    
+    def _evaluate_solution(self, solution, pattern_learner):
+        """
+        Avalia qualidade da solução usando múltiplos critérios
+        """
+        pattern_score = pattern_learner.get_pattern_scores(solution)
+        distribution_score = self._evaluate_distribution(solution)
+        return pattern_score + distribution_score
+    
+    def _evaluate_distribution(self, solution):
+        """
+        Avalia distribuição dos números na solução
+        """
+        even_count = sum(1 for n in solution if n % 2 == 0)
+        even_ratio = even_count / len(solution)
+        optimal_ratio = 0.5  # Proporção ideal entre pares e ímpares
+        distribution_score = 1 - abs(even_ratio - optimal_ratio)
+        
+        # Avalia gaps entre números consecutivos
+        gaps = np.diff(sorted(solution))
+        gap_variance = np.var(gaps)
+        gap_score = 1 / (1 + gap_variance)  # Penaliza variância alta nos gaps
+        
+        return (distribution_score + gap_score) / 2
 
-    def get_trend_metrics(self, window_size=10):
-        """Analisa tendências recentes"""
-        trends = {}
-        recent_data = self.data.tail(window_size)
-        
-        for num in range(1, self.num_numbers + 1):
-            appearances = []
-            for idx in range(len(recent_data)):
-                appeared = 1 if num in [recent_data.iloc[idx][f'Bola{i}'] for i in range(1, 16)] else 0
-                appearances.append(appeared)
-            
-            trend = np.polyfit(range(len(appearances)), appearances, 1)[0]
-            trends[num] = trend
-            
-        return trends
-
-    def calculate_number_weights(self):
-        """Calcula pesos para cada número baseado em todas as métricas"""
-        weights = np.zeros(self.num_numbers)
-        
-        frequencies, recency = self.get_frequency_metrics()
-        patterns = self.get_pattern_metrics()
-        correlations = self.get_correlation_metrics()
-        trends = self.get_trend_metrics()
-        
-        for i in range(self.num_numbers):
-            freq_weight = sum(frequencies[k][i+1] for k in frequencies.keys()) / len(frequencies)
-            recency_weight = 1 / (recency[i+1] + 1)
-            trend_weight = trends[i+1]
-            correlation_weight = np.mean(correlations[i])
-            
-            weights[i] = (
-                0.3 * freq_weight +
-                0.25 * recency_weight +
-                0.25 * trend_weight +
-                0.2 * correlation_weight
-            )
-        
-        weights = (weights - np.min(weights)) / (np.max(weights) - np.min(weights))
-        return weights
+# No início do script, remova a configuração inicial do logging e adicione:
+import logging
+logger = logging.getLogger(__name__)
 
 class LotteryPredictor:
     def __init__(self):
         self.data_file = 'dados.txt'
-        self.lstm = None
-        self.rf = None
-        self.xgb_models = None
         self.models_dir = '.models/'
         self.data_dir = '.data/'
-        self.sequence_length = 15
+        self.sequence_length = 10
         self.num_numbers = 25
         self.numbers_to_choose = 15
+        self.last_prediction = None
+        self.last_prediction_date = None
         
+        # Inicialização dos analisadores
+        self.markov_chain = MarkovChain(self.num_numbers)
+        self.combination_analyzer = CombinationAnalyzer()
+        self.time_series_analyzer = TimeSeriesAnalyzer()
+        self.pattern_learner = PatternLearner()
+        self.stochastic_optimizer = StochasticOptimizer()
+        
+        # Primeiro, cria os diretórios necessários
         for directory in [self.models_dir, self.data_dir]:
             if not os.path.exists(directory):
                 try:
                     os.makedirs(directory)
-                    if os.name == 'nt':
+                    if os.name == 'nt':  # Se for Windows
                         os.system(f'attrib +h "{directory}"')
                 except Exception as e:
                     print(f"Erro ao criar diretório {directory}: {e}")
         
+        # Agora configura o logging após garantir que o diretório existe
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(os.path.join(self.data_dir, 'lottery_predictor.log')),
+                logging.StreamHandler()
+            ]
+        )
+        
+        # Carregamento de dados
         self.historical_data = self._load_data('historical.pkl')
-        self.predictions = self._load_data('predictions.pkl')
-        self.load_models()
-        self.analyzer = None if self.historical_data.empty else StatisticalAnalyzer(self.historical_data)
+        self.predictions_history = self._load_data('predictions.pkl')
+        self.performance_metrics = self._load_data('performance.pkl')
+        
+        if self.historical_data is None:  # Mudado de .empty para None
+            logger.warning("Nenhum dado histórico encontrado. Inicializando novo DataFrame.")
+            self.historical_data = pd.DataFrame()
+        
+        # Inicializa métricas de performance se necessário
+        if self.performance_metrics is None:
+            self.performance_metrics = {
+                'accuracy_history': [],
+                'pattern_success_rate': [],
+                'prediction_hits': defaultdict(int)
+            }
 
     def _load_data(self, filename):
+        """Carrega dados do arquivo"""
         filepath = os.path.join(self.data_dir, filename)
         if os.path.exists(filepath):
             return joblib.load(filepath)
-        return pd.DataFrame()
+        return None
 
     def _save_data(self, data, filename):
+        """Salva dados em arquivo"""
         try:
             filepath = os.path.join(self.data_dir, filename)
             joblib.dump(data, filepath)
         except Exception as e:
-            print(f"Erro ao salvar dados: {e}")
-
-    def load_models(self):
-        try:
-            if all(os.path.exists(os.path.join(self.models_dir, f)) for f in ['lstm.h5', 'rf.pkl', 'xgb_models.pkl']):
-                self.lstm = load_model(os.path.join(self.models_dir, 'lstm.h5'))
-                self.rf = joblib.load(os.path.join(self.models_dir, 'rf.pkl'))
-                self.xgb_models = joblib.load(os.path.join(self.models_dir, 'xgb_models.pkl'))
-                return True
-            return False
-        except Exception as e:
-            print(f"Erro ao carregar modelos: {e}")
-            return False
-
-    def save_models(self):
-        try:
-            self.lstm.save(os.path.join(self.models_dir, 'lstm.h5'))
-            joblib.dump(self.rf, os.path.join(self.models_dir, 'rf.pkl'))
-            joblib.dump(self.xgb_models, os.path.join(self.models_dir, 'xgb_models.pkl'))
-        except Exception as e:
-            print(f"Erro ao salvar modelos: {e}")
+            logger.error(f"Erro ao salvar {filename}: {e}")
 
     def process_new_data(self):
+        """Processa novos dados e atualiza modelos"""
         if not os.path.exists(self.data_file) or os.path.getsize(self.data_file) == 0:
             return False
 
@@ -189,219 +390,330 @@ class LotteryPredictor:
                     new_data = new_data[new_data['Concurso'] > self.historical_data['Concurso'].max()]
                 
                 if not new_data.empty:
+                    # Atualiza dados históricos
                     self.historical_data = pd.concat([self.historical_data, new_data])
                     self._save_data(self.historical_data, 'historical.pkl')
-                    self.analyzer = StatisticalAnalyzer(self.historical_data)
+                    
+                    # Avalia última previsão se existir
+                    if self.last_prediction is not None:
+                        self._evaluate_last_prediction(new_data.iloc[-1])
+                    
+                    # Atualiza todos os modelos
+                    self._update_models()
+                    
+                    # Limpa arquivo de dados
                     open(self.data_file, 'w').close()
                     return True
             return False
         except Exception as e:
-            print(f"Erro ao processar novos dados: {e}")
+            logger.error(f"Erro ao processar novos dados: {e}")
             return False
 
-    def prepare_sequences(self):
-        if len(self.historical_data) < self.sequence_length:
-            return None, None
+    def _evaluate_last_prediction(self, actual_result):
+        """Avalia a última previsão feita"""
+        if self.last_prediction is None:
+            return
+        
+        actual_numbers = [actual_result[f'Bola{i}'] for i in range(1, 16)]
+        hits = len(set(self.last_prediction) & set(actual_numbers))
+        
+        # Atualiza métricas de performance
+        self.performance_metrics['accuracy_history'].append(hits)
+        self.performance_metrics['prediction_hits'][hits] += 1
+        
+        # Análise de padrões bem-sucedidos
+        if hits >= 11:
+            pattern = self.pattern_learner._extract_pattern(self.last_prediction)
+            self.pattern_learner.success_patterns[pattern] += 1
+        
+        self._save_data(self.performance_metrics, 'performance.pkl')
+        
+        logger.info(f"Última previsão obteve {hits} acertos")
 
-        data = np.zeros((len(self.historical_data), self.num_numbers))
-        for idx, row in self.historical_data.iterrows():
-            numbers = [int(row[f'Bola{i}']) - 1 for i in range(1, 16)]
-            data[idx, numbers] = 1
+    def _update_models(self):
+        """Atualiza todos os modelos com novos dados"""
+        sequences = self._get_number_sequences()
+        
+        # Atualiza Cadeia de Markov
+        self.markov_chain.fit(sequences)
+        
+        # Atualiza análise combinatória
+        self.combination_analyzer.analyze_patterns(sequences)
+        
+        # Atualiza análise de séries temporais
+        for num in range(1, self.num_numbers + 1):
+            number_history = self._get_number_history(num)
+            self.time_series_analyzer.fit_arima(number_history, num)
+        
+        # Atualiza aprendizado de padrões
+        self.pattern_learner.update_frequency_matrix(sequences)
 
-        X, y = [], []
-        for i in range(len(data) - self.sequence_length):
-            X.append(data[i:i + self.sequence_length])
-            y.append(data[i + self.sequence_length])
+def _get_number_sequences(self):
+        """Obtém sequências de números dos dados históricos"""
+        sequences = []
+        for _, row in self.historical_data.iterrows():
+            sequence = sorted([int(row[f'Bola{i}']) for i in range(1, 16)])
+            sequences.append(sequence)
+        return sequences
 
-        return np.array(X), np.array(y)
+def _get_number_history(self, number):
+        """Obtém histórico de aparições de um número específico"""
+        history = []
+        for _, row in self.historical_data.iterrows():
+            appeared = 1 if number in [row[f'Bola{i}'] for i in range(1, 16)] else 0
+            history.append(appeared)
+        return np.array(history)
 
-    def train_models(self):
-        X, y = self.prepare_sequences()
-        if X is None or y is None:
-            return False
-
-        try:
-            print("Treinando LSTM...")
-            self.lstm = Sequential([
-                Bidirectional(LSTM(128, return_sequences=True), input_shape=(self.sequence_length, self.num_numbers)),
-                Dropout(0.4),
-                Bidirectional(LSTM(64)),
-                Dropout(0.4),
-                Dense(256, activation='relu'),
-                Dropout(0.4),
-                Dense(self.num_numbers, activation='sigmoid')
-            ])
-            self.lstm.compile(optimizer='adam', loss='binary_crossentropy')
-            
-            early_stopping = EarlyStopping(monitor='loss', patience=5)
-            self.lstm.fit(X, y, epochs=100, batch_size=32, callbacks=[early_stopping], verbose=0)
-            
-            print("Treinando Random Forest...")
-            X_flat = X.reshape(X.shape[0], -1)
-            self.rf = []
-            for i in range(self.num_numbers):
-                rf_model = RandomForestClassifier(n_estimators=200, max_depth=10, min_samples_split=5, n_jobs=-1)
-                rf_model.fit(X_flat, y[:, i])
-                self.rf.append(rf_model)
-            
-            print("Treinando XGBoost...")
-            self.xgb_models = []
-            for i in range(self.num_numbers):
-                model = xgb.XGBClassifier(objective='binary:logistic', max_depth=6, learning_rate=0.1, n_estimators=200)
-                model.fit(X_flat, y[:, i])
-                self.xgb_models.append(model)
-            
-            print("Salvando modelos...")
-            self.save_models()
-            return True
-        except Exception as e:
-            print(f"Erro no treinamento: {e}")
-            traceback.print_exc()
-            return False
-
-    def generate_prediction(self):
+def _calculate_base_probabilities(self):
+        """Calcula probabilidades base para cada número usando múltiplas análises"""
+        probabilities = np.zeros(self.num_numbers)
+        
+        # 1. Probabilidades da Cadeia de Markov
         if self.historical_data.empty:
-            print("Não há dados históricos disponíveis.")
-            return None
+            return np.ones(self.num_numbers) / self.num_numbers
+            
+        last_numbers = sorted([int(self.historical_data.iloc[-1][f'Bola{i}']) for i in range(1, 16)])
+        markov_probs = np.zeros(self.num_numbers)
+        for last_num in last_numbers:
+            markov_probs += self.markov_chain.get_transition_probabilities(last_num)
+        markov_probs /= len(last_numbers)
+        
+        # 2. Probabilidades baseadas em padrões
+        pattern_probs = np.zeros(self.num_numbers)
+        pattern_data = self.combination_analyzer.get_pattern_probabilities()
+        for num in range(1, self.num_numbers + 1):
+            pattern_probs[num-1] = sum(v for k, v in pattern_data.items() if f"_{num}" in k)
+        pattern_probs = pattern_probs / np.sum(pattern_probs)
+        
+        # 3. Probabilidades baseadas em séries temporais
+        arima_probs = np.zeros(self.num_numbers)
+        for num in range(1, self.num_numbers + 1):
+            if num in self.time_series_analyzer.arima_models:
+                try:
+                    forecast = self.time_series_analyzer.arima_models[num].forecast(1)
+                    arima_probs[num-1] = max(0, min(1, forecast[0]))
+                except:
+                    arima_probs[num-1] = 1/self.num_numbers
+        arima_probs = arima_probs / np.sum(arima_probs)
+        
+        # 4. Análise de Recência
+        recency_probs = np.zeros(self.num_numbers)
+        for num in range(1, self.num_numbers + 1):
+            history = self._get_number_history(num)
+            last_appearance = len(history) - 1 - np.argmax(history[::-1])
+            recency_probs[num-1] = 1 / (1 + last_appearance)
+        recency_probs = recency_probs / np.sum(recency_probs)
+        
+        # Combina todas as probabilidades com pesos diferentes
+        weights = [0.3, 0.25, 0.25, 0.2]  # Pesos para cada tipo de probabilidade
+        probabilities = (weights[0] * markov_probs +
+                        weights[1] * pattern_probs +
+                        weights[2] * arima_probs +
+                        weights[3] * recency_probs)
+        
+        return probabilities
 
+def generate_prediction(self):
+        """Gera nova previsão utilizando todos os modelos e análises"""
         try:
-            X, _ = self.prepare_sequences()
-            if X is None:
+            if self.historical_data.empty:
+                logger.error("Não há dados históricos suficientes para gerar previsão")
                 return None
-
-            last_sequence = X[-1:]
-            last_sequence_flat = last_sequence.reshape(1, -1)
-
-            # Previsão LSTM
-            lstm_pred = self.lstm.predict(last_sequence, verbose=0)[0]
-            lstm_pred = np.array(lstm_pred).flatten()[:self.num_numbers]
-
-            # Previsão Random Forest
-            rf_pred = np.zeros(self.num_numbers)
-            for i in range(min(len(self.rf), self.num_numbers)):
-                rf_model = self.rf[i]
-                try:
-                    proba = rf_model.predict_proba(last_sequence_flat)
-                    rf_pred[i] = proba[0, 1] if proba.shape[1] >= 2 else proba[0, 0]
-                except:
-                    try:
-                        pred = rf_model.predict(last_sequence_flat)
-                        rf_pred[i] = pred[0] if isinstance(pred, np.ndarray) else float(pred)
-                    except:
-                        rf_pred[i] = 0.0
-
-            # Previsão XGBoost
-            xgb_pred = np.zeros(self.num_numbers)
-            for i in range(min(len(self.xgb_models), self.num_numbers)):
-                model = self.xgb_models[i]
-                try:
-                    proba = model.predict_proba(last_sequence_flat)
-                    xgb_pred[i] = proba[0, 1] if proba.shape[1] >= 2 else proba[0, 0]
-                except:
-                    try:
-                        pred = model.predict(last_sequence_flat)
-                        xgb_pred[i] = pred[0] if isinstance(pred, np.ndarray) else float(pred)
-                    except:
-                        xgb_pred[i] = 0.0
-
-            # Incorporar análise estatística
-            if self.analyzer:
-                statistical_weights = self.analyzer.calculate_number_weights()
-            else:
-                statistical_weights = np.ones(self.num_numbers) / self.num_numbers
-
-            # Normalização com ruído aleatório
-            def safe_normalize(arr):
-                arr = np.array(arr).flatten()[:self.num_numbers]
-                arr += np.random.normal(0, 0.01, arr.shape)
-                min_val = np.min(arr)
-                max_val = np.max(arr)
-                if max_val - min_val < 1e-10:
-                    return np.random.random(arr.shape)
-                return (arr - min_val) / (max_val - min_val)
-
-            lstm_pred = safe_normalize(lstm_pred)
-            rf_pred = safe_normalize(rf_pred)
-            xgb_pred = safe_normalize(xgb_pred)
-            statistical_weights = safe_normalize(statistical_weights)
-
-            # Combinação das previsões com pesos
-            weights = np.random.dirichlet(np.ones(4))
-            combined = (weights[0] * lstm_pred + 
-                       weights[1] * rf_pred + 
-                       weights[2] * xgb_pred +
-                       weights[3] * statistical_weights)
-
-            numbers = np.argsort(combined)[-self.numbers_to_choose:] + 1
-            numbers = sorted(numbers)
-            # Adiciona aleatoriedade se os números forem iguais ao último sorteio
-            last_numbers = sorted([int(self.historical_data.iloc[-1][f'Bola{i}']) for i in range(1, 16)])
-            if numbers == last_numbers:
-                num_to_replace = np.random.randint(1, 4)
-                indices_to_replace = np.random.choice(len(numbers), num_to_replace, replace=False)
-                new_numbers = list(set(range(1, 26)) - set(numbers))
-                for idx in indices_to_replace:
-                    numbers[idx] = np.random.choice(new_numbers)
-                numbers = sorted(numbers)
-
-            # Salvando a previsão
-            prediction = {
-                'data': datetime.now(),
-                'numeros': numbers,
+            
+            # Calcula probabilidades base
+            base_probabilities = self._calculate_base_probabilities()
+            
+            # Usa otimização estocástica para gerar conjunto final de números
+            optimized_numbers = self.stochastic_optimizer.optimize_selection(
+                base_probabilities,
+                self.pattern_learner
+            )
+            
+            # Valida a previsão
+            if not self._validate_prediction(optimized_numbers):
+                logger.warning("Previsão gerada não passou na validação. Gerando nova previsão...")
+                return self.generate_prediction()
+            
+            # Atualiza última previsão
+            self.last_prediction = optimized_numbers
+            self.last_prediction_date = datetime.now()
+            
+            # Salva previsão no histórico
+            prediction_record = {
+                'data': self.last_prediction_date,
+                'numeros': optimized_numbers,
                 'concurso': self.historical_data['Concurso'].max() + 1
             }
             
-            self.predictions = pd.concat([self.predictions, pd.DataFrame([prediction])])
-            self._save_data(self.predictions, 'predictions.pkl')
-
-            return numbers
+            if self.predictions_history is None:
+                self.predictions_history = pd.DataFrame([prediction_record])
+            else:
+                self.predictions_history = pd.concat([
+                    self.predictions_history,
+                    pd.DataFrame([prediction_record])
+                ])
+            
+            self._save_data(self.predictions_history, 'predictions.pkl')
+            
+            return optimized_numbers
+            
         except Exception as e:
-            print(f"Erro na geração de previsão: {e}")
+            logger.error(f"Erro na geração de previsão: {e}")
             traceback.print_exc()
             return None
 
-    def run(self):
-        print("\n=== Sistema de Previsão da Lotofácil ===")
+def _validate_prediction(self, numbers):
+        """Valida a previsão gerada"""
+        if len(numbers) != self.numbers_to_choose:
+            return False
+            
+        if len(set(numbers)) != self.numbers_to_choose:
+            return False
+            
+        if not all(1 <= n <= self.num_numbers for n in numbers):
+            return False
+            
+        # Verifica se não é igual à última previsão
+        if self.last_prediction is not None:
+            if set(numbers) == set(self.last_prediction):
+                return False
+                
+        # Verifica se não é igual a nenhum resultado histórico
+        for _, row in self.historical_data.iterrows():
+            historical_numbers = set(int(row[f'Bola{i}']) for i in range(1, 16))
+            if set(numbers) == historical_numbers:
+                return False
+                
+        return True 
+
+def generate_performance_report(self):
+        """Gera relatório detalhado de performance do modelo"""
+        if not self.performance_metrics['accuracy_history']:
+            return "Sem dados de performance disponíveis ainda."
         
-        has_new_data = self.process_new_data()
-        models_exist = self.load_models()
+        report = []
+        report.append("\n=== RELATÓRIO DE PERFORMANCE ===")
+        
+        # Estatísticas gerais
+        total_predictions = len(self.performance_metrics['accuracy_history'])
+        avg_hits = np.mean(self.performance_metrics['accuracy_history'])
+        report.append(f"\nTotal de previsões avaliadas: {total_predictions}")
+        report.append(f"Média de acertos: {avg_hits:.2f}")
+        
+        # Distribuição de acertos
+        report.append("\nDistribuição de acertos:")
+        for hits, count in sorted(self.performance_metrics['prediction_hits'].items()):
+            report.append(f"{hits} acertos: {count} vezes ({(count/total_predictions)*100:.1f}%)")
+        
+        return "\n".join(report)
 
-        if has_new_data or not models_exist:
-            print("\nIniciando treinamento dos modelos...")
-            if not self.train_models():
-                print("Erro no treinamento dos modelos.")
-                return
+def analyze_current_trends(self):
+        """Analisa tendências atuais nos dados"""
+        if self.historical_data.empty:
+            return "Sem dados históricos para análise."
+        
+        trends = []
+        trends.append("\n=== ANÁLISE DE TENDÊNCIAS ATUAIS ===")
+        
+        # Análise dos últimos 30 sorteios
+        recent_data = self.historical_data.tail(30)
+        number_freq = defaultdict(int)
+        
+        for _, row in recent_data.iterrows():
+            for i in range(1, 16):
+                number_freq[int(row[f'Bola{i}'])] += 1
+        
+        # Números mais frequentes
+        trends.append("\nNúmeros mais frequentes (últimos 30 sorteios):")
+        most_frequent = sorted(number_freq.items(), key=lambda x: x[1], reverse=True)[:5]
+        for num, freq in most_frequent:
+            trend = self._calculate_number_trend(num)
+            trend_symbol = "↑" if trend > 0 else "↓" if trend < 0 else "→"
+            trends.append(f"Número {num}: {freq} vezes {trend_symbol}")
+        
+        # Números menos frequentes
+        trends.append("\nNúmeros menos frequentes (últimos 30 sorteios):")
+        least_frequent = sorted(number_freq.items(), key=lambda x: x[1])[:5]
+        for num, freq in least_frequent:
+            trend = self._calculate_number_trend(num)
+            trend_symbol = "↑" if trend > 0 else "↓" if trend < 0 else "→"
+            trends.append(f"Número {num}: {freq} vezes {trend_symbol}")
+        
+        # Análise de padrões
+        trends.append("\nPadrões identificados:")
+        patterns = self._analyze_recent_patterns()
+        for pattern, description in patterns.items():
+            trends.append(f"{pattern}: {description}")
+        
+        return "\n".join(trends)
 
-        print("\nGerando previsão...")
+def _calculate_number_trend(self, number, window=10):
+        """Calcula tendência recente de um número"""
+        recent_history = self._get_number_history(number)[-window:]
+        if len(recent_history) < window:
+            return 0
+        slope = np.polyfit(range(len(recent_history)), recent_history, 1)[0]
+        return slope
+
+def _analyze_recent_patterns(self):
+        """Analisa padrões recentes nos sorteios"""
+        patterns = {}
+        recent_draws = self._get_number_sequences()[-5:]  # Últimos 5 sorteios
+        
+        # Análise de paridade
+        even_counts = [sum(1 for n in draw if n % 2 == 0) for draw in recent_draws]
+        avg_even = np.mean(even_counts)
+        patterns['Paridade'] = f"Média de números pares: {avg_even:.1f}"
+        
+        # Análise de soma
+        sums = [sum(draw) for draw in recent_draws]
+        avg_sum = np.mean(sums)
+        patterns['Soma'] = f"Média da soma: {avg_sum:.1f}"
+        
+        # Análise de gaps
+        gaps = [np.mean(np.diff(draw)) for draw in recent_draws]
+        avg_gap = np.mean(gaps)
+        patterns['Intervalos'] = f"Média de intervalo entre números: {avg_gap:.1f}"
+        
+        return patterns
+
+def run(self):
+        """Executa o sistema de previsão"""
+        logger.info("Iniciando sistema de previsão da Lotofácil...")
+        
+        # Processa novos dados
+        if self.process_new_data():
+            logger.info("Novos dados processados com sucesso.")
+        
+        # Gera previsão
+        logger.info("Gerando nova previsão...")
         numbers = self.generate_prediction()
         
         if numbers is not None:
-            print("\nNúmeros sugeridos para o próximo sorteio:")
-            print(numbers)
+            print("\n=== PREVISÃO LOTOFÁCIL ===")
+            print(f"\nNúmeros sugeridos para o próximo sorteio:")
+            print(sorted(numbers))
             
-            if not self.historical_data.empty and self.analyzer:
-                # Análise estatística adicional
-                frequencies, recency = self.analyzer.get_frequency_metrics()
-                trends = self.analyzer.get_trend_metrics()
-                
-                print("\nAnálise dos últimos 30 sorteios:")
-                print("Números mais frequentes:")
-                last_30_freq = frequencies[30]
-                sorted_freq = sorted(last_30_freq.items(), key=lambda x: x[1], reverse=True)
-                for num, freq in sorted_freq[:5]:
-                    trend_direction = "↑" if trends[num] > 0 else "↓" if trends[num] < 0 else "→"
-                    print(f"Número {num}: {freq} vezes {trend_direction}")
-                
-                print("\nNúmeros menos sorteados recentemente:")
-                sorted_recency = sorted(recency.items(), key=lambda x: x[1], reverse=True)
-                for num, rec in sorted_recency[:3]:
-                    print(f"Número {num}: {rec} sorteios sem aparecer")
+            # Exibe análise de tendências
+            print(self.analyze_current_trends())
+            
+            # Exibe relatório de performance
+            print(self.generate_performance_report())
+            
+            # Exibe informações adicionais
+            print("\nInformações adicionais:")
+            print(f"Data da previsão: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+            print(f"Concurso previsto: {self.historical_data['Concurso'].max() + 1}")
+            
+            # Salva logs detalhados
+            logger.info(f"Previsão gerada com sucesso: {numbers}")
         else:
             print("Não foi possível gerar uma previsão.")
+            logger.error("Falha na geração da previsão")
 
 def main():
     predictor = LotteryPredictor()
     predictor.run()
 
 if __name__ == "__main__":
-    main()
+    main()                                       
