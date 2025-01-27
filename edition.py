@@ -20,6 +20,7 @@ import itertools
 from collections import defaultdict, Counter
 import logging
 import json
+import traceback
 
 # PRIMEIRO: Criar diretório .data ANTES de qualquer configuração de logging
 data_dir = '.data'
@@ -190,17 +191,17 @@ class PatternLearner:
                 pattern = self._extract_pattern(pred)
                 self.success_patterns[pattern] += 1
     
-    def _extract_pattern(self, numbers):
-        """
-        Extrai padrões característicos de uma sequência de números
-        """
-        pattern = {
-            'gaps': np.diff(sorted(numbers)).tolist(),
-            'even_ratio': sum(1 for n in numbers if n % 2 == 0) / len(numbers),
-            'sum': sum(numbers),
-            'variance': np.var(numbers)
-        }
-        return json.dumps(pattern)
+def _extract_pattern(self, numbers):
+    """
+    Extrai padrões característicos de uma sequência de números
+    """
+    pattern = {
+        'gaps': [int(x) for x in np.diff(sorted(numbers)).tolist()],  # Convertendo para int
+        'even_ratio': float(sum(1 for n in numbers if n % 2 == 0) / len(numbers)),  # Garantindo float
+        'sum': int(sum(numbers)),  # Convertendo para int
+        'variance': float(np.var(numbers))  # Convertendo para float
+    }
+    return json.dumps(pattern)
     
     def get_pattern_scores(self, candidate_numbers):
         """
