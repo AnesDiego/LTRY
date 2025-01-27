@@ -448,7 +448,7 @@ class LotteryPredictor:
         # Atualiza aprendizado de padrões
         self.pattern_learner.update_frequency_matrix(sequences)
 
-def _get_number_sequences(self):
+    def _get_number_sequences(self):
         """Obtém sequências de números dos dados históricos"""
         sequences = []
         for _, row in self.historical_data.iterrows():
@@ -456,7 +456,7 @@ def _get_number_sequences(self):
             sequences.append(sequence)
         return sequences
 
-def _get_number_history(self, number):
+    def _get_number_history(self, number):
         """Obtém histórico de aparições de um número específico"""
         history = []
         for _, row in self.historical_data.iterrows():
@@ -464,7 +464,7 @@ def _get_number_history(self, number):
             history.append(appeared)
         return np.array(history)
 
-def _calculate_base_probabilities(self):
+    def _calculate_base_probabilities(self):
         """Calcula probabilidades base para cada número usando múltiplas análises"""
         probabilities = np.zeros(self.num_numbers)
         
@@ -513,7 +513,7 @@ def _calculate_base_probabilities(self):
         
         return probabilities
 
-def generate_prediction(self):
+    def generate_prediction(self):
         """Gera nova previsão utilizando todos os modelos e análises"""
         try:
             if self.historical_data.empty:
@@ -562,7 +562,7 @@ def generate_prediction(self):
             traceback.print_exc()
             return None
 
-def _validate_prediction(self, numbers):
+    def _validate_prediction(self, numbers):
         """Valida a previsão gerada"""
         if len(numbers) != self.numbers_to_choose:
             return False
@@ -586,7 +586,7 @@ def _validate_prediction(self, numbers):
                 
         return True 
 
-def generate_performance_report(self):
+    def generate_performance_report(self):
         """Gera relatório detalhado de performance do modelo"""
         if not self.performance_metrics['accuracy_history']:
             return "Sem dados de performance disponíveis ainda."
@@ -607,7 +607,7 @@ def generate_performance_report(self):
         
         return "\n".join(report)
 
-def analyze_current_trends(self):
+    def analyze_current_trends(self):
         """Analisa tendências atuais nos dados"""
         if self.historical_data.empty:
             return "Sem dados históricos para análise."
@@ -647,7 +647,7 @@ def analyze_current_trends(self):
         
         return "\n".join(trends)
 
-def _calculate_number_trend(self, number, window=10):
+    def _calculate_number_trend(self, number, window=10):
         """Calcula tendência recente de um número"""
         recent_history = self._get_number_history(number)[-window:]
         if len(recent_history) < window:
@@ -655,7 +655,7 @@ def _calculate_number_trend(self, number, window=10):
         slope = np.polyfit(range(len(recent_history)), recent_history, 1)[0]
         return slope
 
-def _analyze_recent_patterns(self):
+    def _analyze_recent_patterns(self):
         """Analisa padrões recentes nos sorteios"""
         patterns = {}
         recent_draws = self._get_number_sequences()[-5:]  # Últimos 5 sorteios
